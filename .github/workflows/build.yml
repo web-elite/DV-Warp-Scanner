@@ -1,54 +1,100 @@
 name: Build and Release
 
 permissions:
-  contents: write
+  contents: read
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a GitHub release after all platform builds pass"
+        required: true
+        default: false
+        type: boolean
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      - name: Run tests
+        run: go test ./...
+      - name: Run static analysis
+        run: go vet ./...
 
+  build:
+    permissions:
+      contents: read
+    needs: test
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         goos: [linux, windows, darwin]
         goarch: [amd64, arm64, arm, 386]
         exclude:
+          - goos: windows
+            goarch: arm
           - goos: darwin
             goarch: arm
           - goos: darwin
             goarch: 386
       fail-fast: false
-
     steps:
       - name: Check out code
         uses: actions/checkout@v4
-        
       - name: Setup Go
-        id: go
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.24
+          go-version: '1.24.x'
+          cache: true
+      - name: Read versions
+        run: |
+          echo "VERSION=$(cat VERSION)" >> "$GITHUB_ENV"
+          echo "XRAY_VERSION=$(cat XRAY_VERSION)" >> "$GITHUB_ENV"
+      - name: Build and package
+        run: make build VERSION="$VERSION" XRAY_VERSION="$XRAY_VERSION" GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
+      - name: Upload build artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
 
-      - name: Read version
-        id: version
-        run: echo "VERSION=$(cat VERSION)" >> $GITHUB_ENV
-
-      - name: Build and zip
-        run: make build VERSION=$VERSION GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
-
-      - name: Read release note
-        id: read_release
+  release:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Read release metadata
+        id: metadata
         shell: bash
         run: |
-          r=$(cat RELEASE.md)         
-          r="${r//'%'/'%25'}"                               
-          r="${r//$'\n'/'%0A'}"                             
-          r="${r//$'\r'/'%0D'}"                             
-          echo "RELEASE_BODY=$r" >> $GITHUB_OUTPUT          
-
-      - name: Upload Release Assets
+          echo "VERSION=$(cat VERSION)" >> "$GITHUB_ENV"
+          {
+            echo 'RELEASE_BODY<<EOF_RELEASE_NOTES'
+            cat RELEASE.md
+            echo 'EOF_RELEASE_NOTES'
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish GitHub release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -58,4 +104,4 @@ jobs:
           overwrite: true
           file_glob: true
           prerelease: true
-          body: ${{ steps.read_release.outputs.RELEASE_BODY }}
+          body: ${{ steps.metadata.outputs.RELEASE_BODY }}
