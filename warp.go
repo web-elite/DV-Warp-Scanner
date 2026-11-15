@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/curve25519"
@@ -89,18 +90,27 @@ func fetchWarpConfig(privateKey string) (WarpConfig, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		return WarpConfig{}, fmt.Errorf("HTTP error: %w", err)
-	}
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return WarpConfig{}, fmt.Errorf("error reading warp config: %w", err)
 	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return WarpConfig{}, fmt.Errorf("Cloudflare API returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
 
 	var result WarpConfig
 	if err := json.Unmarshal(body, &result); err != nil {
 		return WarpConfig{}, fmt.Errorf("failed to parse API response: %w", err)
+	}
+	if len(result.Config.Peers) == 0 {
+		return WarpConfig{}, fmt.Errorf("Cloudflare API response does not contain a WireGuard peer")
+	}
+	if strings.TrimSpace(result.Config.Interface.Addresses.V6) == "" {
+		return WarpConfig{}, fmt.Errorf("Cloudflare API response does not contain a WireGuard IPv6 address")
+	}
+	if strings.TrimSpace(result.Config.ClientID) == "" {
+		return WarpConfig{}, fmt.Errorf("Cloudflare API response does not contain a client ID")
 	}
 
 	return result, nil
@@ -120,6 +130,12 @@ func base64ToDecimal(base64Str string) ([]int, error) {
 }
 
 func extractWarpParams(config WarpConfig, privateKey string) (WarpParams, error) {
+	if len(config.Config.Peers) == 0 || strings.TrimSpace(config.Config.Peers[0].PublicKey) == "" {
+		return WarpParams{}, fmt.Errorf("WARP response does not contain a valid WireGuard peer")
+	}
+	if strings.TrimSpace(config.Config.Interface.Addresses.V6) == "" {
+		return WarpParams{}, fmt.Errorf("WARP response does not contain an IPv6 address")
+	}
 	reserved, err := base64ToDecimal(config.Config.ClientID)
 	if err != nil {
 		return WarpParams{}, fmt.Errorf("error extracting warp account: %w", err)

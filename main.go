@@ -93,7 +93,7 @@ func renderHeader() {
 ■■   ■■  ■■       ■■   ■■
 ■■■■■■■  ■■       ■■■■■■■  %s %s
 `,
-		fmtStr("Warp Scanner", BLUE, true),
+		fmtStr("DV Warp Scanner", BLUE, true),
 		fmtStr(VERSION, GREEN, false),
 	)
 }
@@ -208,12 +208,21 @@ func successMessage(message string) {
 }
 
 func init() {
-	showVersion := flag.Bool("version", false, "Show version")
+	showVersion := flag.Bool("version", false, "Show Scanner version")
+	showXrayVersion := flag.Bool("xray-version", false, "Show active Xray-core version")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(VERSION)
 		os.Exit(0)
+	}
+	if *showXrayVersion {
+		fmt.Println(activeXrayVersion())
+		os.Exit(0)
+	}
+	// Package tests must not require a downloaded Xray binary.
+	if strings.HasSuffix(os.Args[0], ".test") {
+		return
 	}
 
 	logDir := filepath.Join(CORE_DIR, "log")
@@ -240,16 +249,12 @@ func init() {
 		binary = "xray"
 	}
 	xrayPath = filepath.Join(CORE_DIR, binary)
+	loadActiveXrayVersion(binary)
 
 	if _, err := os.Stat(xrayPath); err != nil {
-		failMessage("Xray core not found.")
-		log.Fatal(err)
-	}
-
-	err := os.Chmod(xrayPath, 0755)
-	if err != nil {
-		failMessage("Failed to set Xray core permissions.")
-		log.Fatal(err)
+		failMessage("Xray-core is missing. You can install it from Xray-core Manager.")
+	} else if err := os.Chmod(xrayPath, 0755); err != nil {
+		failMessage("Could not update Xray-core file permissions: " + err.Error())
 	}
 
 	path := os.Getenv("PATH")
@@ -316,6 +321,26 @@ func isValidRange(value string) bool {
 }
 
 func main() {
+	managementMenu()
+}
+
+func startScan() {
+	scanConfig.EndpointCount = 100
+	scanConfig.Ipv4Mode = true
+	scanConfig.Ipv6Mode = false
+	scanConfig.IPv4Retries = 3
+	scanConfig.IPv6Retries = 3
+	scanConfig.RetryStaggeringMs = 200
+	scanConfig.EndpointStaggeringMs = 100
+	scanConfig.UseNoise = true
+	scanConfig.UdpNoise = Noise{Type: "rand", Packet: "50-100", Delay: "1-5", Count: 5}
+	scanConfig.Endpoints = nil
+	scanConfig.OutputCount = 0
+	if _, err := os.Stat(xrayPath); err != nil {
+		failMessage("Xray-core is not installed. Open Xray-core Manager and install a version first.")
+		return
+	}
+
 	fmt.Printf("\n%s Quick scan - 100 endpoints", fmtStr("1.", BLUE, true))
 	fmt.Printf("\n%s Normal scan - 1000 endpoints", fmtStr("2.", BLUE, true))
 	fmt.Printf("\n%s Deep scan - 10000 endpoints", fmtStr("3.", BLUE, true))
@@ -506,8 +531,8 @@ func main() {
 
 	results, err := scanEndpoints()
 	if err != nil {
-		failMessage("Scan failed.")
-		log.Fatal(err)
+		failMessage("Scan failed: " + err.Error())
+		return
 	}
 
 	sort.Slice(results, func(i, j int) bool {
@@ -527,6 +552,6 @@ func main() {
 	successMessage("Scan completed.")
 	message := fmt.Sprintf("Found %d endpoints. You can check result.csv for more details.\n", len(results))
 	successMessage(message)
-	fmt.Printf("%s Press any key to exit...", prompt)
+	fmt.Printf("%s Press Enter to return to the management menu...", prompt)
 	fmt.Scanln()
 }

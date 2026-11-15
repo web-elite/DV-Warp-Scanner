@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,7 @@ type Dns struct {
 type Log struct {
 	Access   string `json:"access"`
 	Error    string `json:"error"`
-	Loglevel string `json:"warning"`
+	Loglevel string `json:"loglevel"`
 	DnsLog   bool   `json:"dnsLog,omitempty"`
 }
 
@@ -99,6 +100,7 @@ type XrayConfig struct {
 }
 
 var xrayConfig = filepath.Join(CORE_DIR, "config.json")
+var activeWarpParams *WarpParams
 
 func buildHttpInbound(index int) httpInbound {
 	inbound := httpInbound{
@@ -215,9 +217,15 @@ func buildConfig() (XrayConfig, error) {
 		config.Outbounds = append(config.Outbounds, udpNoiseOutbound)
 	}
 
-	warpConfig, err := getWarpParams()
-	if err != nil {
-		return XrayConfig{}, err
+	var warpConfig WarpParams
+	if activeWarpParams != nil {
+		warpConfig = *activeWarpParams
+	} else {
+		var err error
+		warpConfig, err = getWarpParams()
+		if err != nil {
+			return XrayConfig{}, err
+		}
 	}
 
 	for index, endpoint := range scanConfig.Endpoints {
@@ -261,10 +269,21 @@ func createXrayConfig() error {
 func runXrayCore() (*exec.Cmd, error) {
 	cmd := exec.Command(xrayPath, "-c", xrayConfig)
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("error starting XRay core: %v", err)
+		return nil, fmt.Errorf("could not start Xray-core: %w", err)
 	}
 
-	fmt.Printf("%s Waiting for XRay core to initialize...\n\n", prompt)
-	time.Sleep(1000 * time.Millisecond)
-	return cmd, nil
+	fmt.Printf("%s Waiting for Xray-core to become ready...\n\n", prompt)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:1080", 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return cmd, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+	return nil, fmt.Errorf("Xray-core did not open its first local proxy port (127.0.0.1:1080) within 10 seconds; check core/log/error.log")
 }

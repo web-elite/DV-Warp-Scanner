@@ -7,10 +7,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"time"
-
-	"slices"
 
 	"github.com/schollz/progressbar/v3"
 )
@@ -194,85 +194,127 @@ func checkNetworkStats(preferIPv6 bool) {
 }
 
 func scanEndpoints() ([]ScanResult, error) {
-	err := createXrayConfig()
+	if len(scanConfig.Endpoints) == 0 {
+		return nil, fmt.Errorf("no endpoints were generated")
+	}
+	if scanConfig.IPv4Retries < 1 && scanConfig.IPv6Retries < 1 {
+		return nil, fmt.Errorf("retry count must be at least one")
+	}
+
+	// One WARP registration is shared by all batches. Xray only needs to hold
+	// a limited number of local inbounds at once, even during a Deep scan.
+	warpParams, err := getWarpParams()
 	if err != nil {
+		return nil, err
+	}
+	allEndpoints := scanConfig.Endpoints
+	activeWarpParams = &warpParams
+	defer func() {
+		scanConfig.Endpoints = allEndpoints
+		activeWarpParams = nil
+	}()
+
+	const batchSize = 256
+	allResults := make([]ScanResult, 0, len(allEndpoints))
+	for offset := 0; offset < len(allEndpoints); offset += batchSize {
+		end := min(offset+batchSize, len(allEndpoints))
+		scanConfig.Endpoints = allEndpoints[offset:end]
+		fmt.Printf("\n%s Scanning batch %d/%d (%d endpoints)\n",
+			prompt, offset/batchSize+1, (len(allEndpoints)+batchSize-1)/batchSize, end-offset)
+
+		batchResults, err := scanEndpointBatch()
+		if err != nil {
+			return nil, fmt.Errorf("scan batch %d failed: %w", offset/batchSize+1, err)
+		}
+		allResults = append(allResults, batchResults...)
+	}
+	return allResults, nil
+}
+
+func scanEndpointBatch() ([]ScanResult, error) {
+	if err := createXrayConfig(); err != nil {
 		return nil, err
 	}
 
 	cmd, err := runXrayCore()
 	if err != nil {
-		log.Print(err)
 		return nil, err
 	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
 
-	var wg sync.WaitGroup
+	// A bounded worker pool avoids creating thousands of sleeping goroutines
+	// during Deep scans. Retries run inside each worker, so concurrency is
+	// bounded across the whole scan rather than multiplied by retry count.
+	const maxScanWorkers = 64
+	workerCount := min(maxScanWorkers, len(scanConfig.Endpoints))
+	jobs := make(chan int)
 	results := make(chan ScanResult, len(scanConfig.Endpoints))
-	transports := make([]*http.Transport, len(scanConfig.Endpoints))
 
-	for i, endpoint := range scanConfig.Endpoints {
-		wg.Add(1)
-		go func(endpoint string, portIdx int) {
-			defer wg.Done()
-			time.Sleep(time.Duration(portIdx*scanConfig.EndpointStaggeringMs) * time.Millisecond)
-			proxyURL := must(url.Parse(fmt.Sprintf("http://127.0.0.1:%d", 1080+portIdx)))
-			transport := &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
-			}
-			transports[portIdx] = transport
-
-			currentRetries := scanConfig.IPv4Retries
-			if scanConfig.Ipv6Mode && !scanConfig.Ipv4Mode ||
-				scanConfig.Ipv4Mode && scanConfig.Ipv6Mode && i >= len(scanConfig.Endpoints)/2 {
-				currentRetries = scanConfig.IPv6Retries
-			}
-
-			var successCount int
-			var totalLatency int64
-
-			var innerWg sync.WaitGroup
-			latencies := make(chan int64, currentRetries)
-
-			for t := range currentRetries {
-				innerWg.Add(1)
-				go func(delay int) {
-					defer innerWg.Done()
-					time.Sleep(time.Duration(delay) * time.Millisecond)
-					client := &http.Client{
-						Timeout:   2 * time.Second,
-						Transport: transport,
-					}
-
-					start := time.Now()
-					resp, err := client.Head("http://www.gstatic.com/generate_204")
-					latency := time.Since(start).Milliseconds()
-					if err == nil && resp.StatusCode == 204 {
-						if resp.Body != nil {
-							resp.Body.Close()
-						}
-						latencies <- latency
-					} else {
-						latencies <- -1
-					}
-				}(t * scanConfig.RetryStaggeringMs)
-			}
-			innerWg.Wait()
-			close(latencies)
-
-			for l := range latencies {
-				if l >= 0 {
-					successCount++
-					totalLatency += l
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for workerID := 0; workerID < workerCount; workerID++ {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				endpoint := scanConfig.Endpoints[index]
+				if scanConfig.EndpointStaggeringMs > 0 {
+					time.Sleep(time.Duration(scanConfig.EndpointStaggeringMs) * time.Millisecond)
 				}
-			}
 
-			if successCount == 0 {
-				log.Printf("[%d] %s -> %s\n", i+1, fmtStr(endpoint, ORANGE, false), fmtStr("Failed", RED, true))
-			} else {
+				proxyURL := &url.URL{
+					Scheme: "http",
+					Host:   fmt.Sprintf("127.0.0.1:%d", 1080+index),
+				}
+				transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+				client := &http.Client{
+					Timeout:   2 * time.Second,
+					Transport: transport,
+				}
+
+				retries := scanConfig.IPv4Retries
+				if strings.HasPrefix(endpoint, "[") {
+					retries = scanConfig.IPv6Retries
+				}
+				if retries < 1 {
+					retries = 1
+				}
+
+				var successCount int
+				var totalLatency int64
+				for attempt := 0; attempt < retries; attempt++ {
+					if attempt > 0 && scanConfig.RetryStaggeringMs > 0 {
+						time.Sleep(time.Duration(scanConfig.RetryStaggeringMs) * time.Millisecond)
+					}
+					started := time.Now()
+					resp, requestErr := client.Head("http://www.gstatic.com/generate_204")
+					latency := time.Since(started).Milliseconds()
+					if requestErr == nil && resp != nil {
+						if resp.StatusCode == http.StatusNoContent {
+							successCount++
+							totalLatency += latency
+						}
+						if resp.Body != nil {
+							_ = resp.Body.Close()
+						}
+					}
+				}
+				transport.CloseIdleConnections()
+
+				if successCount == 0 {
+					log.Printf("[%d] %s -> %s\n", index+1, fmtStr(endpoint, ORANGE, false), fmtStr("Failed", RED, true))
+					continue
+				}
+
 				avgLatency := totalLatency / int64(successCount)
-				lossRate := float64(currentRetries-successCount) / float64(currentRetries) * 100
+				lossRate := float64(retries-successCount) / float64(retries) * 100
 				results <- ScanResult{Endpoint: endpoint, Loss: lossRate, Latency: avgLatency}
 				log.Printf("[%d] %s -> %s - %s %.1f %% - %s %d ms\n",
-					i+1,
+					index+1,
 					fmtStr(endpoint, ORANGE, false),
 					fmtStr("Success", GREEN, true),
 					fmtStr("Loss rate:", "", true),
@@ -281,21 +323,24 @@ func scanEndpoints() ([]ScanResult, error) {
 					avgLatency,
 				)
 			}
-		}(endpoint, i)
-	}
-	wg.Wait()
-	close(results)
-
-	var allResults []ScanResult
-	for r := range results {
-		allResults = append(allResults, r)
+		}()
 	}
 
-	if err := cmd.Process.Kill(); err != nil {
-		return nil, fmt.Errorf("error killing Xray core: %w", err)
-	}
+	go func() {
+		defer close(jobs)
+		for index := range scanConfig.Endpoints {
+			jobs <- index
+		}
+	}()
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
 
-	cmd.Wait()
+	allResults := make([]ScanResult, 0, len(scanConfig.Endpoints))
+	for result := range results {
+		allResults = append(allResults, result)
+	}
 
 	return allResults, nil
 }
